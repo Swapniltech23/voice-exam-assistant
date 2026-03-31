@@ -1,0 +1,11 @@
+gradio
+transformers
+torch
+soundfile
+pymupdf
+pytesseract
+Pillow
+datasets
+num2words
+sentence-transformers
+sentencepiece
