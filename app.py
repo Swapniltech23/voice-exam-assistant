@@ -19,6 +19,7 @@ pytesseract.pytesseract.tesseract_cmd = r'D:\exam\Tesseract-OCR\tesseract.exe'
 os.environ["TESSDATA_PREFIX"] = r'D:\exam\Tesseract-OCR\tessdata'
 
 print("Loading heavy AI models... This might take a minute...")
+qa_generator = pipeline("text2text-generation", model="google/flan-t5-base")
 
 processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
 tts_model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
@@ -133,6 +134,111 @@ def grade_answers(answer_key_file):
         f.write(report)
     return report
 
+def grade_answers_auto():
+    if not os.path.exists("student_answers.json"):
+        return "No student answers found."
+
+    if not os.path.exists("auto_answer_key.json"):
+        return "No auto answer key found."
+
+    with open("student_answers.json", "r") as f:
+        student = json.load(f)
+
+    with open("auto_answer_key.json", "r") as f:
+        answer_key = json.load(f)
+
+    results = []
+    total_marks = 0
+
+    for qnum, data in student.items():
+        student_ans = data["answer"]
+        model_ans = answer_key.get(qnum, {}).get("answer", "")
+
+        if not model_ans:
+            results.append(f"{qnum}: No model answer provided")
+            continue
+
+        emb1 = similarity_model.encode(student_ans, convert_to_tensor=True)
+        emb2 = similarity_model.encode(model_ans, convert_to_tensor=True)
+
+        score = float(util.cos_sim(emb1, emb2)[0][0])
+        percentage = round(score * 100, 1)
+        max_marks = 10
+        
+        if score > 0.85:
+            marks = 10
+        elif score > 0.75:
+            marks = 8
+        elif score > 0.6:
+            marks = 6
+        elif score > 0.45:
+            marks = 4
+        elif score > 0.3:
+            marks = 2
+        else:
+           marks = 0
+        
+
+
+
+        verdict = (
+            "Correct" if score > 0.75 else
+            "Partial" if score > 0.45 else
+            "Incorrect"
+        )
+
+        total_marks += marks
+
+        results.append(
+            f"{qnum}: {verdict} | Marks: {marks}/10 ({percentage}%)\n"
+            f"  Student: {student_ans}\n"
+            f"  Expected: {model_ans}\n"
+        )
+
+    avg = round((total_marks / len(student)) * 100, 1) if student else 0
+    results.append(f"\nTotal Marks: {total_marks}/{len(student)*10}")
+
+    return "\n".join(results)
+
+
+
+def generate_answer_key(questions):
+    answer_key = {}
+
+    for i, q in enumerate(questions):
+        try:
+            prompt = f"""
+                      You are an expert teacher.
+
+                       Answer the following question correctly and briefly.
+                       Do NOT repeat sentences.
+                       Do NOT generate nonsense.
+
+                       Question: {q}
+
+                      Answer:
+                      """
+            result = qa_generator(
+                prompt,
+                max_length=100,
+                do_sample=True,
+                temperature=0.7,
+                repetition_penalty=1.5
+                )
+            answer = result[0]['generated_text']
+        except:
+            answer = "Error generating answer"
+
+        answer_key[f"Q{i+1}"] = {
+            "answer": answer
+        }
+
+    with open("auto_answer_key.json", "w") as f:
+        json.dump(answer_key, f, indent=2)
+
+    return answer_key
+
+
 # ---------------- GRADIO UI ----------------
 with gr.Blocks() as app:
     gr.Markdown("# Voice Exam Assistant for Visually Impaired Students")
@@ -160,7 +266,6 @@ with gr.Blocks() as app:
 
     # --- SECTION 2: GRADING ---
     gr.Markdown("### Part 2: Grade the Exam (Teacher Only)")
-    answer_key_input = gr.File(label="Upload Answer Key (JSON)")
     grade_btn = gr.Button("Grade Exam", variant="secondary")
     grade_output = gr.Textbox(label="Final Grade Report", lines=10, interactive=False)
 
@@ -168,6 +273,7 @@ with gr.Blocks() as app:
     def load_exam(pdf):
         qs = extract_questions(pdf)
         student_answers.clear()
+        generate_answer_key(qs)
         audio = speak(
             "Exam loaded. There are " + str(len(qs)) +
             " questions. After each question is read, please speak your answer clearly."
@@ -190,9 +296,10 @@ with gr.Blocks() as app:
             transcribed = f"Error: {str(e)}"
 
         # Step 2 — filter out noise / too short answers
-        if len(transcribed.strip().split()) < 2:
-            audio_out = speak("Sorry, I didn't catch that. Please answer again.")
-            return idx, questions[idx], audio_out, "Didn't catch that. Please try again.", f"Question {idx+1} of {len(questions)}"
+        if len(transcribed.strip()) < 3 or transcribed.lower() in ["you", "thank you", "thanks"]:
+            audio_out = speak("Please give a proper answer.")
+            return idx, questions[idx], audio_out, "Try again", f"Question {idx+1} of {len(questions)}"
+        
 
         # Step 3 — save answer
         if idx < len(questions):
@@ -229,9 +336,9 @@ with gr.Blocks() as app:
     )
 
     grade_btn.click(
-        grade_answers,
-        inputs=[answer_key_input],
-        outputs=[grade_output]
-    )
+    grade_answers_auto,
+    inputs=[],
+    outputs=[grade_output]
+)
 
 app.launch()
